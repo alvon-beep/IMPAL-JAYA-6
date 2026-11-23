@@ -276,7 +276,7 @@ async function handleSavePreferences() {
             <AppIcon name="wind" :size="20" />
           </div>
           <p class="font-semibold text-[#285765]">Belum ada laporan</p>
-          <p class="mt-1 text-xs text-[var(--muted)]">Kamu belum mengunggah laporan kualitas udara.</p>
+          <p class="mt-1 text-xs text-[var(--muted)]">Kamu belum mengunggah laporan kualitas udara. Buat laporan pertamamu dari halaman komunitas.</p>
         </div>
 
         <div v-else class="grid grid-cols-3 gap-1.5 sm:gap-3">
