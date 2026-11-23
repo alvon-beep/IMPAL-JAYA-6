@@ -39,8 +39,44 @@ export function optionalToken(req, _res, next) {
 }
 
 export function requireAdmin(req, res, next) {
-  if (!req.user || req.user.role !== 'ADMIN') {
+  if (!req.user || String(req.user.role || '').toUpperCase() !== 'ADMIN') {
     return res.status(403).json({ message: 'Akses ditolak. Hanya untuk Admin.' });
   }
+  return next();
+}
+
+export function extractTokenFromRequest(req) {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.split(' ')[1];
+  }
+  const cookieHeader = req.headers.cookie || '';
+  const match = cookieHeader.match(/(?:^|;\s*)polusee_dev_token=([^;]+)/);
+  if (match && match[1]) {
+    return decodeURIComponent(match[1]);
+  }
+  return null;
+}
+
+export function verifyDeveloperToken(req) {
+  const token = extractTokenFromRequest(req);
+  if (!token) return { ok: false, status: 401, message: 'Autentikasi Developer diperlukan.' };
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (String(decoded.role || '').toUpperCase() !== 'DEVELOPER') {
+      return { ok: false, status: 403, message: 'Akses ditolak. Khusus role DEVELOPER.' };
+    }
+    return { ok: true, user: decoded };
+  } catch {
+    return { ok: false, status: 401, message: 'Sesi Developer tidak valid atau telah berakhir.' };
+  }
+}
+
+export function requireDeveloper(req, res, next) {
+  const check = verifyDeveloperToken(req);
+  if (!check.ok) {
+    return res.status(check.status).json({ message: check.message });
+  }
+  req.user = check.user;
   return next();
 }

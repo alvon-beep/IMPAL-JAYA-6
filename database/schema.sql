@@ -25,7 +25,7 @@ DROP TYPE IF EXISTS status_moderasi_enum CASCADE;
 DROP TYPE IF EXISTS status_verifikasi_enum CASCADE;
 
 -- Definisi Tipe ENUM sesuai Class Diagram SKPL-1000
-CREATE TYPE role_enum AS ENUM ('USER', 'ADMIN');
+CREATE TYPE role_enum AS ENUM ('USER', 'ADMIN', 'DEVELOPER');
 CREATE TYPE status_publikasi_enum AS ENUM ('DRAFT', 'PUBLISHED', 'ARCHIVED');
 CREATE TYPE status_moderasi_enum AS ENUM ('AKTIF', 'DISEMBUNYIKAN', 'DIHAPUS');
 CREATE TYPE status_verifikasi_enum AS ENUM ('PENDING', 'TERVERIFIKASI', 'DITOLAK');

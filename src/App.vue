@@ -221,7 +221,10 @@ const lessons = ref([...initialLessons]);
 
 const REPORTS_CACHE_KEY = 'polusee_cached_reports';
 const REPORTS_CACHE_TS_KEY = 'polusee_cached_reports_ts';
-const CLIENT_FEED_TTL_MS = 15 * 1000; // 15 detik cache sisi client (Express tetap melayani dari RAM, 0 B egress Supabase)
+const CLIENT_FEED_TTL_MS = 5 * 60 * 1000; // 5 menit cache sisi client (hanya di-fetch saat buka Komunitas/Profil/Admin)
+const LESSONS_CACHE_KEY = 'polusee_cached_lessons';
+const LESSONS_CACHE_TS_KEY = 'polusee_cached_lessons_ts';
+const CLIENT_LESSONS_TTL_MS = 30 * 60 * 1000; // 30 menit cache edukasi di browser
 
 function getCachedReports() {
   try {
@@ -496,11 +499,37 @@ function onManualCityChange() {
   isLiveTracking.value = false;
 }
 
+let hasFetchedFeedInSession = false;
+let hasFetchedLessonsInSession = false;
+let hasFetchedProfileInSession = false;
+
+function getCachedLessons() {
+  try {
+    const ts = Number(localStorage.getItem(LESSONS_CACHE_TS_KEY) || '0');
+    if (ts > 0 && Date.now() - ts < CLIENT_LESSONS_TTL_MS) {
+      const raw = localStorage.getItem(LESSONS_CACHE_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    }
+  } catch {}
+  return null;
+}
+
+function saveCachedLessons(items) {
+  try {
+    if (Array.isArray(items) && items.length > 0) {
+      localStorage.setItem(LESSONS_CACHE_KEY, JSON.stringify(items));
+      localStorage.setItem(LESSONS_CACHE_TS_KEY, String(Date.now()));
+    }
+  } catch {}
+}
+
 async function fetchCommunityFeed(force = false) {
-  if (!force && reports.value.length > 0 && isReportsCacheFresh()) {
+  if (!force && (hasFetchedFeedInSession || (reports.value.length > 0 && isReportsCacheFresh()))) {
     loadingFeed.value = false;
     return;
   }
+  loadingFeed.value = reports.value.length === 0;
   try {
     const feedRes = await apiRequest('/komunitas/feed');
     const feedItems = feedRes?.reports || feedRes?.feed_komunitas;
@@ -519,6 +548,7 @@ async function fetchCommunityFeed(force = false) {
         };
       });
       saveCachedReports(reports.value);
+      hasFetchedFeedInSession = true;
     }
   } catch (err) {
     console.warn('[PoluSee Frontend] Gagal memuat feed komunitas:', err.message);
@@ -527,41 +557,34 @@ async function fetchCommunityFeed(force = false) {
   }
 }
 
-// Mengambil data global (Edukasi, Komunitas bila diperlukan, Profil) dari Backend
-async function fetchGlobalData(forceFeed = false) {
+async function fetchEducationData(force = false) {
+  if (!force && hasFetchedLessonsInSession) return;
+  if (!force) {
+    const cached = getCachedLessons();
+    if (cached) {
+      lessons.value = cached;
+      hasFetchedLessonsInSession = true;
+      return;
+    }
+  }
   try {
-    const needsFeedNow =
-      forceFeed ||
-      page.value === 'community' ||
-      page.value === 'profile' ||
-      admin.value ||
-      reports.value.length === 0 ||
-      !isReportsCacheFresh();
-
-    const hasToken = Boolean(getStoredToken());
-
-    const [eduRes, profRes] = await Promise.allSettled([
-      apiRequest('/edukasi'),
-      hasToken ? apiRequest('/profile') : Promise.resolve(null),
-      needsFeedNow ? fetchCommunityFeed(forceFeed) : Promise.resolve(null),
-    ]);
-
-    if (eduRes.status === 'fulfilled' && eduRes.value?.list_konten?.length > 0) {
+    const eduRes = await apiRequest('/edukasi');
+    if (eduRes?.list_konten?.length > 0) {
       const cleanStr = (s) => (s ? String(s).replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\r\n/g, '\n') : '');
-      lessons.value = eduRes.value.list_konten.map((item, idx) => {
+      lessons.value = eduRes.list_konten.map((item, idx) => {
         const fallback = initialLessons[idx] || initialLessons[0] || {};
         const title = cleanStr(item.judul_konten || item.title || fallback.title || 'Materi Edukasi Udara');
         const topic = cleanStr(item.kategori_topik || item.topic || fallback.topic || 'Kenali udara');
         const rawMateri = cleanStr(item.isi_materi || '');
         const summary = cleanStr(item.summary) || (rawMateri ? rawMateri.split('\n')[0].trim() : cleanStr(fallback.summary));
-        
+
         let sections = [];
         if (Array.isArray(item.sections) && item.sections.length > 0) {
-          sections = item.sections.map(s => cleanStr(s)).filter(Boolean);
+          sections = item.sections.map((s) => cleanStr(s)).filter(Boolean);
         } else if (rawMateri) {
-          sections = rawMateri.split(/\n+/).map(p => p.trim()).filter(Boolean);
+          sections = rawMateri.split(/\n+/).map((p) => p.trim()).filter(Boolean);
         } else {
-          sections = fallback.sections ? fallback.sections.map(s => cleanStr(s)) : [summary];
+          sections = fallback.sections ? fallback.sections.map((s) => cleanStr(s)) : [summary];
         }
 
         const cover = item.media_url || item.cover || fallback.cover || '';
@@ -581,12 +604,41 @@ async function fetchGlobalData(forceFeed = false) {
           audience,
         };
       });
+      saveCachedLessons(lessons.value);
+      hasFetchedLessonsInSession = true;
     }
+  } catch (err) {
+    console.warn('[PoluSee Frontend] Gagal memuat edukasi:', err.message);
+  }
+}
 
-    if (profRes.status === 'fulfilled' && profRes.value?.profil_user) {
-      Object.assign(userProfileStore, profRes.value.profil_user);
+async function fetchUserProfileData(force = false) {
+  if (!getStoredToken()) return;
+  if (!force && (hasFetchedProfileInSession || userProfileStore.id_akun)) return;
+  try {
+    const profRes = await apiRequest('/profile');
+    if (profRes?.profil_user) {
+      Object.assign(userProfileStore, profRes.profil_user);
       saveStoredUser(userProfileStore);
+      hasFetchedProfileInSession = true;
     }
+  } catch (err) {
+    console.warn('[PoluSee Frontend] Gagal memuat profil:', err.message);
+  }
+}
+
+// Fetch hanya data yang BENAR-BENAR dibutuhkan oleh halaman yang sedang dibuka (on-demand)
+async function fetchGlobalData(forceFeed = false) {
+  try {
+    const isFeedPage = page.value === 'community' || page.value === 'profile' || admin.value;
+    const isEduPage = page.value === 'home' || page.value === 'education' || admin.value;
+    const needsProfile = page.value === 'profile' || (Boolean(getStoredToken()) && !userProfileStore.id_akun);
+
+    await Promise.allSettled([
+      isEduPage ? fetchEducationData(false) : Promise.resolve(null),
+      needsProfile ? fetchUserProfileData(false) : Promise.resolve(null),
+      isFeedPage || forceFeed ? fetchCommunityFeed(forceFeed) : Promise.resolve(null),
+    ]);
   } catch (err) {
     console.warn('[PoluSee Frontend] Gagal mengambil data global:', err.message);
   } finally {
@@ -594,10 +646,23 @@ async function fetchGlobalData(forceFeed = false) {
   }
 }
 
-// Saat membuka halaman komunitas atau profil, pastikan feed dimuat jika cache sudah kedaluwarsa
+// Fetch otomatis hanya saat user membuka halaman terkait (tidak menembak Supabase saat reload halaman lain)
 watch(page, (newPage) => {
   if (newPage === 'community' || newPage === 'profile') {
     fetchCommunityFeed(false);
+  }
+  if (newPage === 'profile') {
+    fetchUserProfileData(false);
+  }
+  if (newPage === 'home' || newPage === 'education') {
+    fetchEducationData(false);
+  }
+});
+
+watch(admin, (isAdmin) => {
+  if (isAdmin) {
+    fetchCommunityFeed(false);
+    fetchEducationData(false);
   }
 });
 
