@@ -56,8 +56,80 @@ watch(
 );
 
 /**
+ * Kirim Kode OTP 6 Digit ke Email (purpose: 'register' | 'reset')
+ */
+export async function sendAuthOtp(email, purpose = 'register') {
+  const cleanEmail = (email || '').trim().toLowerCase();
+  const res = await apiRequest('/auth/send-otp', {
+    method: 'POST',
+    body: JSON.stringify({ email: cleanEmail, purpose }),
+  });
+  return res;
+}
+
+/**
+ * Autentikasi Google OAuth (POST /api/auth/google)
+ */
+export async function loginWithGoogle(credential) {
+  const res = await apiRequest('/auth/google', {
+    method: 'POST',
+    body: JSON.stringify({ credential }),
+  });
+  if (res?.needsProfile) {
+    return {
+      needsProfile: true,
+      google_signup_token: res.google_signup_token,
+      googleUser: res.googleUser,
+    };
+  }
+  if (res && res.token) {
+    const profilData = res.profil || res.user;
+    if (profilData) {
+      Object.assign(userProfileStore, profilData);
+    }
+    setStoredSession(res.token, userProfileStore);
+    return {
+      needsProfile: false,
+      success: true,
+      role: res.role || userProfileStore.role || 'USER',
+    };
+  }
+  throw new Error('Gagal melakukan autentikasi Google.');
+}
+
+/**
+ * Selesaikan Pendaftaran Akun Baru Google Auth (POST /api/auth/google/complete)
+ */
+export async function completeGoogleRegistration({
+  google_signup_token,
+  nama,
+  lokasi_default,
+  kategori_rentan,
+  umur,
+}) {
+  const res = await apiRequest('/auth/google/complete', {
+    method: 'POST',
+    body: JSON.stringify({
+      google_signup_token,
+      nama,
+      lokasi_default: lokasi_default || 'Samarinda',
+      kategori_rentan: kategori_rentan || 'Umum',
+      umur: Number(umur) || 25,
+    }),
+  });
+  if (res && res.token) {
+    const userData = res.user || res.profil;
+    if (userData) {
+      Object.assign(userProfileStore, userData);
+    }
+    setStoredSession(res.token, userProfileStore);
+    return { success: true, role: res.role || 'USER' };
+  }
+  throw new Error('Gagal menyimpan profil pendaftaran Google.');
+}
+
+/**
  * Autentikasi Login (UC-01 SKPL: POST /api/auth/login)
- * Terhubung 100% ke Backend Express.js + PostgreSQL Supabase (tanpa simulasi lokal).
  */
 export async function loginAccount(email, password) {
   const res = await apiRequest('/auth/login', {
@@ -80,10 +152,17 @@ export async function loginAccount(email, password) {
 }
 
 /**
- * Registrasi Akun Baru (UC-02 SKPL: POST /api/auth/register)
- * Terhubung 100% ke Backend Express.js + PostgreSQL Supabase (tanpa simulasi lokal).
+ * Registrasi Akun Baru Manual dengan OTP Email (UC-02 SKPL: POST /api/auth/register)
  */
-export async function registerAccount({ name, email, password, confirmPassword, lokasi_default }) {
+export async function registerAccount({
+  name,
+  email,
+  password,
+  confirmPassword,
+  lokasi_default,
+  otp_code,
+  otp_token,
+}) {
   const res = await apiRequest('/auth/register', {
     method: 'POST',
     body: JSON.stringify({
@@ -92,6 +171,8 @@ export async function registerAccount({ name, email, password, confirmPassword, 
       password,
       konfirmasi: confirmPassword,
       lokasi_default: lokasi_default || 'Samarinda',
+      otp_code,
+      otp_token,
     }),
   });
   if (res && res.token) {
@@ -125,7 +206,13 @@ export async function updateProfileData(payload) {
   }
 }
 
-export async function forgotPasswordAccount({ email, newPassword, confirmPassword }) {
+export async function forgotPasswordAccount({
+  email,
+  newPassword,
+  confirmPassword,
+  otp_code,
+  otp_token,
+}) {
   const cleanEmail = (email || '').trim().toLowerCase();
   const cleanPassword = (newPassword || '').trim();
 
@@ -136,6 +223,8 @@ export async function forgotPasswordAccount({ email, newPassword, confirmPasswor
       password: cleanPassword,
       newPassword: cleanPassword,
       confirmPassword,
+      otp_code,
+      otp_token,
     }),
   });
   return {

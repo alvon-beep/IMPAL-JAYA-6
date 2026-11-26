@@ -1,18 +1,312 @@
 /**
-* ============================================================================
-* MODUL BACKEND: AUTENTIKASI (UC-01 LOGIN & UC-02 REGISTRASI)
-* File: backend/src/modules/auth/auth.controller.js
-* ============================================================================
-*/
+ * ============================================================================
+ * MODUL BACKEND: AUTENTIKASI (LOGIN, REGISTRASI OTP, GOOGLE OAUTH, RESET SANDI)
+ * File: backend/src/modules/auth/auth.controller.js
+ * ============================================================================
+ */
 
+import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { query } from '../../config/db.js';
+import { sendOtpEmail } from '../../services/emailService.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'polusee_super_secret_jwt_key_2025';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
-// UC-01: Login Sistem (User & Admin)
+function hashOtp(email, otpCode, purpose) {
+  return crypto
+    .createHmac('sha256', JWT_SECRET)
+    .update(`${String(email).trim().toLowerCase()}:${purpose}:${String(otpCode).trim()}`)
+    .digest('hex');
+}
+
+function verifyOtpToken({ email, otp_code, otp_token, expectedPurpose }) {
+  if (!otp_code || !otp_token) {
+    return { ok: false, status: 400, message: 'Kode verifikasi (OTP) wajib diisi.' };
+  }
+  try {
+    const decoded = jwt.verify(otp_token, JWT_SECRET);
+    const cleanEmail = String(email).trim().toLowerCase();
+    if (decoded.purpose !== expectedPurpose || decoded.email !== cleanEmail) {
+      return { ok: false, status: 400, message: 'Token verifikasi tidak sesuai dengan email Anda.' };
+    }
+    const expectedHash = hashOtp(cleanEmail, otp_code, expectedPurpose);
+    const actualBuf = Buffer.from(String(decoded.otpHash || ''), 'hex');
+    const expectedBuf = Buffer.from(expectedHash, 'hex');
+    if (actualBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(actualBuf, expectedBuf)) {
+      return { ok: false, status: 400, message: 'Kode verifikasi salah. Silakan periksa kembali email Anda.' };
+    }
+    return { ok: true };
+  } catch {
+    return {
+      ok: false,
+      status: 400,
+      message: 'Kode verifikasi sudah kedaluwarsa (lebih dari 10 menit). Silakan kirim ulang kode.',
+    };
+  }
+}
+
+function buildProfilResponse(account) {
+  const userRole = account.role || 'USER';
+  return {
+    id_akun: account.id_akun,
+    nama_lengkap: account.nama_lengkap,
+    username: account.username || `@${(account.email || 'pengguna').split('@')[0]}`,
+    email: account.email,
+    role: userRole,
+    umur: account.umur != null ? account.umur : 25,
+    lokasi_default: account.lokasi_default || 'Samarinda',
+    kategori_rentan: account.kategori_rentan || 'Umum',
+    peringatan_aqi_100: account.peringatan_aqi_100 ?? false,
+    foto_profil: account.foto_profil || '',
+  };
+}
+
+// ============================================================================
+// KIRIM KODE OTP 6 DIGIT KE EMAIL (UNTUK REGISTRASI MANUAL & RESET PASSWORD)
+// ============================================================================
+export async function sendOtp(req, res) {
+  try {
+    const { email, purpose = 'register' } = req.body || {};
+    const cleanEmail = String(email || '').trim().toLowerCase();
+
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({ message: 'Format alamat email tidak valid.' });
+    }
+    if (!['register', 'reset'].includes(purpose)) {
+      return res.status(400).json({ message: 'Tujuan verifikasi tidak valid.' });
+    }
+
+    const existing = await query(
+      'SELECT id_akun FROM akun WHERE LOWER(TRIM(email)) = $1 LIMIT 1',
+      [cleanEmail]
+    );
+    const exists = existing && existing.rows.length > 0;
+
+    if (purpose === 'register' && exists) {
+      return res
+        .status(409)
+        .json({ message: 'Email sudah terdaftar. Silakan masuk atau gunakan email lain.' });
+    }
+    if (purpose === 'reset' && !exists) {
+      return res
+        .status(404)
+        .json({ message: 'Akun dengan email tersebut tidak ditemukan di database.' });
+    }
+
+    const otpCode = String(crypto.randomInt(100000, 1000000));
+    await sendOtpEmail(cleanEmail, otpCode, purpose);
+
+    const otpToken = jwt.sign(
+      {
+        email: cleanEmail,
+        purpose,
+        otpHash: hashOtp(cleanEmail, otpCode, purpose),
+      },
+      JWT_SECRET,
+      { expiresIn: '10m' }
+    );
+
+    return res.status(200).json({
+      success: true,
+      otp_token: otpToken,
+      message: `Kode verifikasi 6 digit telah dikirim ke ${cleanEmail}. Periksa inbox atau folder spam Anda.`,
+    });
+  } catch (err) {
+    return res.status(500).json({
+      message: err.message || 'Gagal mengirim kode verifikasi ke email.',
+    });
+  }
+}
+
+// ============================================================================
+// GOOGLE OAUTH SIGN-IN (VERIFIKASI ID TOKEN GOOGLE)
+// ============================================================================
+export async function googleAuth(req, res) {
+  try {
+    const { credential } = req.body || {};
+    if (!credential) {
+      return res.status(400).json({ message: 'Token Google tidak ditemukan.' });
+    }
+
+    const verifyRes = await fetch(
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(credential)}`
+    );
+    if (!verifyRes.ok) {
+      return res.status(401).json({ message: 'Token Google tidak valid atau telah kedaluwarsa.' });
+    }
+
+    const payload = await verifyRes.json();
+    const expectedClientId = (process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || '').trim();
+    if (expectedClientId && payload.aud !== expectedClientId) {
+      return res.status(401).json({ message: 'Google Client ID tidak cocok.' });
+    }
+    if (payload.email_verified !== 'true' && payload.email_verified !== true) {
+      return res.status(401).json({ message: 'Email akun Google Anda belum terverifikasi.' });
+    }
+
+    const cleanEmail = String(payload.email || '').trim().toLowerCase();
+    const googleName = String(payload.name || cleanEmail.split('@')[0]).trim();
+    const googlePicture = String(payload.picture || '').trim();
+
+    const result = await query(
+      `SELECT a.*, u.lokasi_default, u.latitude, u.longitude, u.kategori_rentan, u.foto_profil,
+              u.username, u.umur, u.peringatan_aqi_100
+       FROM akun a
+       LEFT JOIN users u ON a.id_akun = u.id_akun
+       WHERE LOWER(TRIM(a.email)) = $1
+       LIMIT 1`,
+      [cleanEmail]
+    );
+
+    if (result && result.rows.length > 0) {
+      const account = result.rows[0];
+      const userRole = account.role || 'USER';
+      const token = jwt.sign(
+        { id_akun: account.id_akun, email: account.email, role: userRole },
+        JWT_SECRET,
+        { expiresIn: JWT_EXPIRES_IN }
+      );
+      return res.status(200).json({
+        needsProfile: false,
+        token,
+        role: userRole,
+        profil: buildProfilResponse(account),
+      });
+    }
+
+    // User Google baru: kembalikan token sementara agar frontend menampilkan form Lengkapi Profil
+    const googleSignupToken = jwt.sign(
+      {
+        purpose: 'google_signup',
+        email: cleanEmail,
+        name: googleName,
+        picture: googlePicture,
+      },
+      JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+
+    return res.status(200).json({
+      needsProfile: true,
+      google_signup_token: googleSignupToken,
+      googleUser: {
+        email: cleanEmail,
+        name: googleName,
+        picture: googlePicture,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({
+      message: 'Gagal memverifikasi akun Google.',
+      error: err.message,
+    });
+  }
+}
+
+// ============================================================================
+// LENGKAPI PROFIL UNTUK PENGGUNA BARU GOOGLE AUTH
+// ============================================================================
+export async function completeGoogleSignup(req, res) {
+  try {
+    const {
+      google_signup_token,
+      nama,
+      lokasi_default = 'Samarinda',
+      kategori_rentan = 'Umum',
+      umur = 25,
+    } = req.body || {};
+
+    if (!google_signup_token) {
+      return res.status(400).json({ message: 'Sesi pendaftaran Google tidak ditemukan. Silakan ulangi login Google.' });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(google_signup_token, JWT_SECRET);
+      if (decoded.purpose !== 'google_signup' || !decoded.email) {
+        throw new Error('Invalid token');
+      }
+    } catch {
+      return res.status(401).json({ message: 'Sesi pendaftaran Google sudah kedaluwarsa. Silakan klik Masuk dengan Google lagi.' });
+    }
+
+    const cleanEmail = String(decoded.email).trim().toLowerCase();
+    const finalName = String(nama || decoded.name || cleanEmail.split('@')[0]).trim();
+    const finalPicture = String(decoded.picture || '').trim();
+    const finalUmur = Number(umur) > 0 && Number(umur) <= 120 ? Number(umur) : 25;
+
+    if (!finalName) {
+      return res.status(400).json({ message: 'Nama lengkap wajib diisi.' });
+    }
+
+    const existing = await query(
+      'SELECT id_akun FROM akun WHERE LOWER(TRIM(email)) = $1 LIMIT 1',
+      [cleanEmail]
+    );
+    if (existing && existing.rows.length > 0) {
+      return res.status(409).json({ message: 'Akun dengan email Google ini sudah terdaftar. Silakan langsung masuk.' });
+    }
+
+    // Buat password hash acak yang aman karena akun ini login melalui Google OAuth
+    const randomPass = crypto.randomBytes(24).toString('hex');
+    const passwordHash = await bcrypt.hash(randomPass, 10);
+
+    const insertAkun = await query(
+      `INSERT INTO akun (nama_lengkap, email, password_hash, role, status_aktif)
+       VALUES ($1, $2, $3, 'USER', TRUE)
+       RETURNING id_akun, nama_lengkap, email, role`,
+      [finalName, cleanEmail, passwordHash]
+    );
+
+    const createdAkun = insertAkun.rows[0];
+    const defaultUsername = `@${cleanEmail.split('@')[0]}`;
+
+    await query(
+      `INSERT INTO users (id_akun, lokasi_default, kategori_rentan, foto_profil, username, umur, peringatan_aqi_100)
+       VALUES ($1, $2, $3, $4, $5, $6, TRUE)`,
+      [
+        createdAkun.id_akun,
+        lokasi_default || 'Samarinda',
+        kategori_rentan || 'Umum',
+        finalPicture || null,
+        defaultUsername,
+        finalUmur,
+      ]
+    );
+
+    const token = jwt.sign(
+      { id_akun: createdAkun.id_akun, email: createdAkun.email, role: 'USER' },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+
+    return res.status(201).json({
+      token,
+      role: 'USER',
+      user: {
+        id_akun: createdAkun.id_akun,
+        nama_lengkap: createdAkun.nama_lengkap,
+        username: defaultUsername,
+        email: createdAkun.email,
+        role: 'USER',
+        umur: finalUmur,
+        lokasi_default: lokasi_default || 'Samarinda',
+        kategori_rentan: kategori_rentan || 'Umum',
+        peringatan_aqi_100: true,
+        foto_profil: finalPicture,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({
+      message: 'Gagal menyelesaikan pendaftaran akun Google.',
+      error: err.message,
+    });
+  }
+}
+
+// UC-01: Login Sistem (User & Admin — tanpa OTP)
 export async function login(req, res) {
   try {
     const { email, password } = req.body;
@@ -45,7 +339,6 @@ export async function login(req, res) {
       });
     }
 
-    // Verifikasi kata sandi dengan bcrypt
     let isPasswordValid = false;
     if (account.password_hash) {
       try {
@@ -62,7 +355,6 @@ export async function login(req, res) {
     }
 
     const userRole = account.role || 'USER';
-
     const token = jwt.sign(
       {
         id_akun: account.id_akun,
@@ -76,28 +368,17 @@ export async function login(req, res) {
     return res.status(200).json({
       token,
       role: userRole,
-      profil: {
-        id_akun: account.id_akun,
-        nama_lengkap: account.nama_lengkap,
-        username: account.username || `@${(account.email || 'pengguna').split('@')[0]}`,
-        email: account.email,
-        role: userRole,
-        umur: account.umur != null ? account.umur : 25,
-        lokasi_default: account.lokasi_default || 'Samarinda',
-        kategori_rentan: account.kategori_rentan || 'Umum',
-        peringatan_aqi_100: account.peringatan_aqi_100 ?? false,
-        foto_profil: account.foto_profil || '',
-      },
+      profil: buildProfilResponse(account),
     });
   } catch (err) {
     return res.status(500).json({ message: 'Gagal memproses login.', error: err.message });
   }
 }
 
-// UC-02: Registrasi Akun Baru (<<include>> Login)
+// UC-02: Registrasi Akun Baru Manual (Wajib Verifikasi OTP Email)
 export async function register(req, res) {
   try {
-    const { nama, email, password, konfirmasi, lokasi_default } = req.body;
+    const { nama, email, password, konfirmasi, lokasi_default, otp_code, otp_token } = req.body;
     if (!nama || !email || !password) {
       return res
         .status(400)
@@ -110,6 +391,17 @@ export async function register(req, res) {
     }
 
     const cleanEmail = String(email).trim().toLowerCase();
+
+    // Wajib verifikasi OTP email sebelum akun dibuat
+    const otpCheck = verifyOtpToken({
+      email: cleanEmail,
+      otp_code,
+      otp_token,
+      expectedPurpose: 'register',
+    });
+    if (!otpCheck.ok) {
+      return res.status(otpCheck.status).json({ message: otpCheck.message });
+    }
 
     try {
       const check = await query('SELECT id_akun FROM akun WHERE LOWER(TRIM(email)) = $1', [cleanEmail]);
@@ -136,15 +428,14 @@ export async function register(req, res) {
     }
 
     const createdAkun = insertAkun.rows[0];
-
     const defaultUsername = `@${cleanEmail.split('@')[0]}`;
+
     await query(
       `INSERT INTO users (id_akun, lokasi_default, kategori_rentan, username, umur, peringatan_aqi_100)
        VALUES ($1, $2, 'Umum', $3, 25, TRUE)`,
       [createdAkun.id_akun, lokasi_default || 'Samarinda', defaultUsername]
     );
 
-    // <<include>> UC-01 Login: Terbitkan JWT Token sesi langsung
     const token = jwt.sign(
       {
         id_akun: createdAkun.id_akun,
@@ -178,10 +469,10 @@ export async function register(req, res) {
   }
 }
 
-// UC-03: Lupa Kata Sandi & Atur Ulang Sandi
+// UC-03: Lupa Kata Sandi & Atur Ulang Sandi (Wajib Verifikasi OTP Email Aktif)
 export async function forgotPassword(req, res) {
   try {
-    const { email, password, newPassword, confirmPassword } = req.body;
+    const { email, password, newPassword, confirmPassword, otp_code, otp_token } = req.body;
     const targetPassword = (newPassword || password || '').trim();
 
     if (!email) {
@@ -199,6 +490,17 @@ export async function forgotPassword(req, res) {
 
     const cleanEmail = String(email).trim().toLowerCase();
 
+    // Wajib verifikasi OTP dari email aktif sebelum mengganti password
+    const otpCheck = verifyOtpToken({
+      email: cleanEmail,
+      otp_code,
+      otp_token,
+      expectedPurpose: 'reset',
+    });
+    if (!otpCheck.ok) {
+      return res.status(otpCheck.status).json({ message: otpCheck.message });
+    }
+
     const result = await query(
       `SELECT a.id_akun, a.email, a.password_hash FROM akun a WHERE LOWER(TRIM(a.email)) = $1`,
       [cleanEmail]
@@ -210,7 +512,6 @@ export async function forgotPassword(req, res) {
 
     const account = result.rows[0];
 
-    // Validasi: kata sandi baru tidak boleh sama dengan kata sandi sebelumnya
     if (account.password_hash) {
       const isSamePassword = await bcrypt.compare(targetPassword, account.password_hash);
       if (isSamePassword) {
